@@ -7,7 +7,13 @@
  *
  *   - QR login (`weixin_login` tool / automatic on load when configured)
  *   - long-poll getupdates for inbound messages
- *   - per-sender DSH agent sessions (`weixin-<senderId>`), driven with
+ *   - Fixed single session (`weixin-main`) for all inbound messages
+ *   - `/new` command creates fresh session (weixin-main-2, ...)
+ *   - Sender identity prepended to message text
+ *   - `weixin_login` tool / automatic on load when configured
+ *   - long-poll getupdates for inbound messages
+ *   - per-peer `context_token` tracking (disk persisted)
+ *   - `weixin_send` tool for proactive pushes
  *     `agent.followup()`; assistant completions are sent back to WeChat
  *   - per-peer `context_token` tracking (disk persisted)
  *   - `weixin_send` tool for proactive pushes
@@ -17,12 +23,12 @@
  */
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { WeixinBridge, sessionIdForUser } from './bridge.js';
+import { WeixinBridge } from './bridge.js';
 import { WeixinPoller } from './poller.js';
 import { registerWeixinTools } from './tools.js';
 import { listWeixinAccounts, loadWeixinAccount, saveWeixinAccount, } from './account.js';
 import { fetchQr, pollLogin } from './ilink/login.js';
-export { WeixinBridge, sessionIdForUser } from './bridge.js';
+export { WeixinBridge } from './bridge.js';
 export { WeixinPoller } from './poller.js';
 export { accountsDir, saveWeixinAccount, loadWeixinAccount, listWeixinAccounts } from './account.js';
 export const name = 'dsh-weixin';
