@@ -1,11 +1,10 @@
 /**
  * The bridge between WeChat and DSH agents.
  *
- * - Inbound: a parsed iLink message maps to a per-sender DSH agent session
- *   (`weixin-<senderId>`) and is delivered with `agent.followup()`.
- * - Outbound: `session/event` `assistant/message` completion anchors from
- *   those sessions are formatted, chunked, and sent back over iLink with the
- *   peer's latest `context_token`.
+ * - Inbound: all messages route to a single fixed session (`weixin-main`).
+ *   Sender identity is prepended to message text so the model knows who spoke.
+ * - Outbound: replies are sent to the last active chatId.
+ * - `/new` creates a fresh session (`weixin-main-2`, `weixin-main-3`, ...).
  */
 import { randomUUID } from 'node:crypto';
 import { MessageId } from '@deepseek-ai/dsh-llm';
@@ -13,18 +12,27 @@ import { SessionId } from '@deepseek-ai/dsh-session';
 import { ContextTokenStore } from './account.js';
 import { sendMessage, isStaleSession, isRateLimited } from './ilink/client.js';
 import { normalizeMarkdown, splitTextForDelivery, WEIXIN_MAX_MESSAGE_LENGTH } from './message.js';
+
 const SESSION_PREFIX = 'weixin-';
+const MAIN_SESSION = 'weixin-main';
 const MESSAGE_DEDUP_TTL_MS = 300_000;
-/** Wrap a sender id into a DSH session id. */
-export function sessionIdForUser(userId) {
-    return SessionId(`${SESSION_PREFIX}${userId}`);
+
+/** Fixed session id — all WeChat messages land here. */
+export function sessionIdForUser() {
+    return SessionId(MAIN_SESSION);
 }
+
 export function isWeixinSession(sessionId) {
-    return sessionId.startsWith(SESSION_PREFIX);
+    return sessionId === MAIN_SESSION || sessionId.startsWith(SESSION_PREFIX);
 }
-export function userIdFromSession(sessionId) {
-    return sessionId.slice(SESSION_PREFIX.length);
+
+/** Extract chatId from a reply annotation like `[to:zhangsan]`. */
+function extractRecipient(text) {
+    const m = text.match(/^\s*\[to:([^\]]+)\]\s*/);
+    if (m) return { recipient: m[1], text: text.slice(m[0].length) };
+    return null;
 }
+
 export class WeixinBridge {
     ctx;
     tokens;
@@ -32,6 +40,10 @@ export class WeixinBridge {
     creating = new Map();
     dedup = new Map();
     opts;
+    /** The chatId that sent the most recent inbound message. */
+    lastChatId = null;
+    /** Counter for /new sessions. */
+    sessionCounter = 0;
     constructor(ctx, account, options) {
         this.ctx = ctx;
         this.tokens = new ContextTokenStore(options.dshHome);
@@ -54,6 +66,9 @@ export class WeixinBridge {
     }
     log(level, msg, ...rest) {
         this.opts.log(level, msg, ...rest);
+    }
+    get currentSessionId() {
+        return SessionId(this.sessionCounter === 0 ? MAIN_SESSION : `${MAIN_SESSION}-${this.sessionCounter}`);
     }
     /** Register the outbound listener that forwards assistant replies to WeChat. */
     attach() {
@@ -80,7 +95,7 @@ export class WeixinBridge {
         return false;
     }
     /**
-     * Deliver one inbound WeChat message to the owning agent session.
+     * Deliver one inbound WeChat message to the fixed agent session.
      * Returns false when the message was ignored (dedup, empty, or no account).
      */
     async deliverInbound(payload) {
@@ -90,38 +105,57 @@ export class WeixinBridge {
         if (contextToken) {
             this.tokens.set(account.account_id, senderId, contextToken);
         }
-        const contentKey = `${senderId}:${hashText(text)}`;
+
+        // Handle /new command
+        if (text.trim() === '/new') {
+            this.sessionCounter += 1;
+            const newId = this.currentSessionId;
+            this.log('info', `/new requested → switching to ${newId}`);
+            // Dispose old session handle if any
+            const old = this.handles.get(newId);
+            if (old) {
+                await old.dispose();
+                this.handles.delete(newId);
+            }
+            // Send confirmation back
+            await this.sendToWeChat(chatId, `已创建新对话：${newId}`);
+            return true;
+        }
+
+        const contentKey = `main:${hashText(text)}`;
         if (this.isDuplicate(messageId, contentKey)) {
             this.log('debug', `dedup: skipping ${messageId ?? contentKey}`);
             return false;
         }
-        const agent = await this.getOrCreateAgent(senderId);
+
+        this.lastChatId = chatId;
+        const agent = await this.getOrCreateAgent();
+        const displayName = senderId === chatId ? senderId : `${senderId}(@${chatId})`;
         agent.followup({
             id: MessageId(`weixin-in-${messageId ?? randomUUID()}`),
             role: 'user',
-            content: [{ type: 'text', text }],
+            content: [{ type: 'text', text: `[微信: ${displayName}] ${text}` }],
             source: { kind: 'plugin', plugin: 'dsh-weixin' },
         });
-        this.log('info', `inbound from=${senderId} -> agent=${agent.id}`);
+        this.log('info', `inbound from=${displayName} → session=${this.currentSessionId}`);
         return true;
     }
-    /** Find or create the agent session for one WeChat sender. */
-    async getOrCreateAgent(userId) {
-        const sessionId = sessionIdForUser(userId);
+    /** Find or create the single fixed agent session. */
+    async getOrCreateAgent() {
+        const sessionId = this.currentSessionId;
         const existing = this.ctx.agents.get(sessionId);
         if (existing)
             return existing;
-        const inflight = this.creating.get(userId);
+        const inflight = this.creating.get(sessionId);
         if (inflight)
             return inflight;
-        const creating = this.createAgent(userId).finally(() => {
-            this.creating.delete(userId);
+        const creating = this.createAgent(sessionId).finally(() => {
+            this.creating.delete(sessionId);
         });
-        this.creating.set(userId, creating);
+        this.creating.set(sessionId, creating);
         return creating;
     }
-    async createAgent(userId) {
-        const sessionId = sessionIdForUser(userId);
+    async createAgent(sessionId) {
         this.log('info', `creating agent session ${sessionId}`);
         const handle = await this.ctx.agents.create({
             sessionId,
@@ -135,12 +169,27 @@ export class WeixinBridge {
     async onSessionEvent(session, event) {
         if (event.type !== 'assistant/message')
             return;
-        if (!isWeixinSession(session.id))
+        const sid = session.id;
+        if (!isWeixinSession(sid))
             return;
-        const chatId = userIdFromSession(session.id);
-        const text = contentToText(event.data.message.content);
+        // Only reply if this event belongs to the current active session
+        if (sid !== this.currentSessionId)
+            return;
+
+        let text = contentToText(event.data.message.content);
         if (!text)
             return;
+
+        // Support explicit recipient annotation [to:chatId]
+        const recipient = extractRecipient(text);
+        const chatId = recipient?.recipient ?? this.lastChatId;
+        if (recipient) {
+            text = recipient.text;
+        }
+        if (!chatId) {
+            this.log('warn', 'no chatId for reply; skipping');
+            return;
+        }
         try {
             await this.sendToWeChat(chatId, text);
         }
@@ -228,4 +277,3 @@ function hashText(text) {
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
-//# sourceMappingURL=bridge.js.map
