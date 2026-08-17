@@ -1,5 +1,12 @@
 {
-  "name": "dsh-weixin-plugin-installed",
-  "private": true,
-  "type": "module"
+  "name": "dsh-weixin",
+  "version": "0.1.0",
+  "description": "DSH ↔ WeChat connector plugin (Tencent iLink Bot API)",
+  "type": "module",
+  "main": "dist/index.js",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/detongz/oh-my-dsh-weixin-connector.git"
+  }
 }
