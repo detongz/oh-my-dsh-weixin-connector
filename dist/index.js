@@ -32,7 +32,7 @@ export { WeixinBridge } from './bridge.js';
 export { WeixinPoller } from './poller.js';
 export { accountsDir, saveWeixinAccount, loadWeixinAccount, listWeixinAccounts } from './account.js';
 export const name = 'dsh-weixin';
-export const inject = ['tools', 'agents', 'attachments'];
+export const inject = ['tools', 'agents', 'attachments', 'connection'];
 const DEFAULT_PROVIDER = 'deepseek-official';
 const DEFAULT_MODEL = 'deepseek-v4-flash';
 function resolveDshHome(config) {
@@ -130,6 +130,57 @@ export function apply(ctx, config = {}) {
         },
     };
     // ── model-facing tools ──────────────────────────────────────────────────
+    const host = { bridge, poller, login: loginManager, dshHome };
+    registerWeixinTools(ctx, host);
+    // ── browser-facing RPC endpoints ────────────────────────────────────────
+    ctx.inject(['connection'], (connectionCtx) => {
+        connectionCtx.connection.rpc.intercept(
+            '/api',
+            (endpoint) => endpoint === 'weixin/status' || endpoint === 'weixin/login' || endpoint === 'weixin/newSession',
+            async (endpoint, payload, signal) => {
+                try {
+                    if (endpoint === 'weixin/status') {
+                        const account = bridge.currentAccount;
+                        return {
+                            ok: true,
+                            value: {
+                                connected: !!account,
+                                accountId: account?.account_id ?? null,
+                                sessionId: bridge.currentSessionId,
+                                polling: poller.running,
+                                loginRunning: loginManager.loginRunning,
+                            },
+                        };
+                    }
+                    if (endpoint === 'weixin/login') {
+                        const result = await loginManager.startLogin();
+                        if (result.error) {
+                            return { ok: false, error: { code: 'internal', message: result.error, details: {} } };
+                        }
+                        if (result.alreadyRunning) {
+                            return { ok: false, error: { code: 'conflict', message: 'QR login already in progress', details: {} } };
+                        }
+                        return { ok: true, value: { qrUrl: result.qrUrl } };
+                    }
+                    if (endpoint === 'weixin/newSession') {
+                        bridge.sessionCounter += 1;
+                        const newId = bridge.currentSessionId;
+                        const old = bridge.handles.get(newId);
+                        if (old) {
+                            await old.dispose();
+                            bridge.handles.delete(newId);
+                        }
+                        return { ok: true, value: { sessionId: newId } };
+                    }
+                    return { ok: false, error: { code: 'not-found', message: `unknown endpoint ${endpoint}`, details: {} } };
+                } catch (error) {
+                    return { ok: false, error: { code: 'internal', message: error instanceof Error ? error.message : String(error), details: {} } };
+                }
+            },
+            { authority: 'loopback' },
+        );
+    });
+    // ── lifecycle ───────────────────────────────────────────────────────────
     const host = { bridge, poller, login: loginManager, dshHome };
     registerWeixinTools(ctx, host);
     // ── lifecycle ───────────────────────────────────────────────────────────
